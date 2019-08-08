@@ -1,77 +1,131 @@
 # *_*coding:utf-8 *_*
 
+import pickle
 import torch
+import codecs
 import torch.optim as optim
+from data_preprocess import Data_preprocess
 from model import BiLSTM_CRF
+from utils import f1_score
 
-START_TAG = "<START>"
-STOP_TAG = "<STOP>"
-EMBEDDING_DIM = 5
-HIDDEN_DIM = 4
 
-def prepare_sequence(seq, to_ix):
-    idxs = [to_ix[w] for w in seq]
+BATCH_SIZE = 128
+EMBEDDING_SIZE = 100
+HIDDEN_SIZE = 128
+DROPOUT = 1.0
 
-    return torch.tensor(idxs, dtype=torch.long).cuda()
+class ChineseNER():
+    def __init__(self, entry='train'):
+        if entry == 'train':
+            self.train_manager = Data_preprocess(batch_size=BATCH_SIZE)
+            self.total_size = len(self.train_manager.batch_data)
+            data = {
+                'batch_size': self.train_manager.batch_size,
+                'input_size': self.train_manager.input_size,
+                'vocab': self.train_manager.vocab,
+                'tags_map': self.train_manager.tags_map
+            }
+            self.save_params(data)
+            dev_manager = Data_preprocess(batch_size=BATCH_SIZE, data_type='dev')
+            self.dev_batch = dev_manager.iteration()
 
-# Make up some training data
-training_data = [(
-    "the wall street journal reported today that apple corporation made money".split(),
-    "B I I I O O O B I O O".split()
-), (
-    "georgia tech is a university in georgia".split(),
-    "B I O O O O B".split()
-)]
+            self.model = BiLSTM_CRF(
+                vocab_size=len(self.train_manager.vocab),
+                tag_to_ix=self.train_manager.tags_map,
+                embedding_dim=EMBEDDING_SIZE,
+                hidden_dim=HIDDEN_SIZE,
+                batch_size=BATCH_SIZE
+            )
+            self.model.cuda()
 
-word_to_ix = {}
-for sentence, tags in training_data:
-    for word in sentence:
-        if word not in word_to_ix:
-            word_to_ix[word] = len(word_to_ix)
+        elif entry == 'predict':
+            data_map = self.load_params()
+            input_size = data_map.get('input_size')
+            self.tags_map = data_map.get('tags_map')
+            self.vocab = data_map.get('vocab')
 
-tag_to_ix = {"B": 0, "I": 1, "O": 2, START_TAG: 3, STOP_TAG: 4}
-ix_to_tag = {v: k for k, v in tag_to_ix.items()}
+            self.model = BiLSTM_CRF(
+                vocab_size=input_size,
+                tag_to_ix=self.tags_map,
+                embedding_dim=EMBEDDING_SIZE,
+                hidden_dim=HIDDEN_SIZE
+            )
+            self.model.cuda()
+            self.restore_model()
 
-model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM)
-optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
-model.cuda()
+    def save_params(self, data):
+        with codecs.open('../data/data.pkl', 'wb') as f:
+            pickle.dump(data, f)
 
-# Check predictions before training
-with torch.no_grad():
-    precheck_sent = prepare_sequence(training_data[0][0], word_to_ix)
+    def restore_model(self):
+        self.model.load_state_dict(torch.load('../data/params.pkl'))
 
-    score, tag_seq = model(precheck_sent)
+        print('model restore success!')
 
-    print(score)
-    print(training_data[0][0])
-    print([ix_to_tag[k] for k in tag_seq])
+    def load_params(self):
+        with codecs.open('../data/data.pkl', 'rb') as f:
+            data_map = pickle.load(f)
 
-# Make sure prepare_sequence from earlier in the LSTM section is loaded
-for epoch in range(300):    # again, normally you would NOT do 300 epochs, it is toy data
-    for sentence, tags in training_data:
-        # Step 1. Remember that Pytorch accumulates gradients.
-        # We need to clear them out before each instance
-        model.zero_grad()
+        return data_map
 
-        # Step 2. Get our inputs ready for the network, that is,
-        # turn them into Tensors of word indices.
-        sentence_in = prepare_sequence(sentence, word_to_ix)
-        targets = torch.tensor([tag_to_ix[t] for t in tags], dtype=torch.long).cuda()
+    def train(self):
+        optimizer = optim.Adam(self.model.parameters())
 
-        # Step 3. Run our forward pass.
-        loss = model.neg_log_likelihood(sentence_in, targets)
+        for epoch in range(50):
+            index = 0
+            for batch in self.train_manager.get_batch():
+                index += 1
+                self.model.zero_grad()
 
-        # Step 4. Compute the loss, gradients, and update the parameters by
-        # calling optimizer.step()
-        loss.backward()
-        optimizer.step()
+                sentences, tags, length = zip(*batch)
+                sentences_tensor = torch.tensor(sentences, dtype=torch.long).cuda()
+                tags_tensor = torch.tensor(tags, dtype=torch.long).cuda()
+                length_tensor = torch.tensor(length, dtype=torch.long).cuda()
 
-# Check predictions before training
-with torch.no_grad():
-    precheck_sent = prepare_sequence(training_data[0][0], word_to_ix)
+                loss = self.model.neg_log_likelihood(sentences_tensor,
+                                                     tags_tensor,
+                                                     length_tensor)
+                progress = ('█' * int(index * 25 / self.total_size)).ljust(25)
+                print(f'epoch [{epoch+1}] |{progress}| '
+                      f'{index}/{self.total_size}\n\t'
+                      f'loss {loss.cpu().tolist()[0]:.2f}')
 
-    score, tag_seq = model(precheck_sent)
+                print('-'*50)
+                loss.backward()
+                optimizer.step()
 
-    print(score)
-    print(training_data[0][0])
-    print([ix_to_tag[k] for k in tag_seq])
+            self.evaluate()
+            print('*' * 50)
+            torch.save(self.model.state_dict(), '../data/params.pkl')
+
+    def evaluate(self):
+        sentences, tags, lengths = zip(*self.dev_batch.__next__())
+        _, paths = self.model(sentences, lengths)
+        print('\tevaluation')
+        f1_score(tags, paths, lengths)
+
+    def predict(self, input_str=''):
+        ix_to_ner = {v: k for k, v in self.tags_map.items()}
+        if not input_str:
+            input_str = input('请输入文本:')
+        input_vec = [self.vocab.get(str, 0) for str in input_str]
+        sentences = torch.tensor(input_vec).view(1, -1).cuda()
+        _, paths = self.model(sentences, [sentences.size(1)])
+
+        res = []
+        for path in paths[0]:
+            res.append(ix_to_ner[path])
+
+        print(input_str)
+        print(res)
+
+
+if __name__ == '__main__':
+    type = input('train or predict\n')
+    # type = 'train'
+    if type == 'train':
+        ner = ChineseNER('train')
+        ner.train()
+    elif type == 'predict':
+        ner = ChineseNER('predict')
+        ner.predict()
